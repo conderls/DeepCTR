@@ -18,6 +18,8 @@ from tensorflow.python.keras.layers import Layer
 from tensorflow.python.keras.regularizers import l2
 from tensorflow.python.layers import utils
 
+import numpy as np
+
 from .activation import activation_layer
 from .utils import concat_func, reduce_sum, softmax, reduce_mean
 
@@ -1482,4 +1484,89 @@ class FEFMLayer(Layer):
         config.update({
             'regularizer': self.regularizer,
         })
+        return config
+
+
+class LogTransformLayer(Layer):
+    """Logarithmic Transformation Layer in Adaptive factorization network, which models arbitrary-order cross features.
+
+      Input shape
+        - 3D tensor with shape: ``(batch_size, field_size, embedding_size)``.
+      Output shape
+        - 2D tensor with shape: ``(batch_size, ltl_hidden_size*embedding_size)``.
+      Arguments
+        - **field_size** : positive integer, number of feature groups
+        - **embedding_size** : positive integer, embedding size of sparse features
+        - **ltl_hidden_size** : integer, the number of logarithmic neurons in AFN
+      References
+        - Cheng, W., Shen, Y. and Huang, L. 2020. Adaptive Factorization Network: Learning Adaptive-Order Feature
+         Interactions. Proceedings of the AAAI Conference on Artificial Intelligence. 34, 04 (Apr. 2020), 3609-3616.
+    """
+
+    def __init__(self, ltl_hidden_size, **kwargs):
+        super(LogTransformLayer, self).__init__(**kwargs)
+        self.ltl_hidden_size = ltl_hidden_size
+
+    def check_dim(self, input_shape):
+        if len(input_shape) != 3:
+            raise ValueError(
+                "Unexpected inputs dimensions %d, expect to be 3 dimensions" % (
+                    len(input_shape))
+            )
+
+    def build(self, input_shape):
+        self.check_dim(input_shape)
+        self.field_size = input_shape[1]
+        self.embedding_size = input_shape[2]
+
+        self.ltl_weights = self.add_weight(
+            name="ltl_weights",
+            shape=(self.field_size, self.ltl_hidden_size),
+            initializer=tf.keras.initializers.random_normal(stddev=0.1),
+            regularizer=None,
+            trainable=True,
+        )
+        self.ltl_biases = self.add_weight(
+            name='ltl_biases',
+            shape=(self.ltl_hidden_size),
+            initializer=Zeros(),
+        )
+
+        self.bn_layers = [tf.keras.layers.BatchNormalization() for _ in range(2)]
+
+        # Be sure to call this somewhere!
+        super(LogTransformLayer, self).build(input_shape)
+
+    def call(self, inputs, training=None, **kwargs):
+        self.check_dim(inputs.get_shape())
+
+        # Avoid numeric overflow in Logarithmic Transformation
+        afn_inputs = tf.clip_by_value(tf.abs(inputs), 1e-4, np.inf)
+        # transpose to shape: ``(batch_size, embedding_size, field_size)``
+        afn_inputs_trans = tf.transpose(afn_inputs, perm=[0, 2, 1])
+        ltl_result = tf.log(afn_inputs_trans, name="log_input")
+        ltl_result = tf.check_numerics(ltl_result, name="log2")
+
+        ltl_result = self.bn_layers[0](ltl_result)
+        ltl_result = tf.einsum('bef,fo->beo', ltl_result, self.ltl_weights) + self.ltl_biases
+
+        interactions = tf.exp(ltl_result, name="exp_trans")
+        interactions = self.bn_layers[1](interactions)
+
+        # output: ``(batch_size, ltl_hidden_size*embedding_size)``
+        interactions = tf.reshape(interactions, shape=[-1, self.embedding_size * self.ltl_hidden_size])
+
+        return interactions
+
+    def compute_output_shape(self, input_shape):
+        return None, self.ltl_hidden_size * self.embedding_size
+
+    def get_config(self):
+        config = super(LogTransformLayer, self).get_config().copy()
+        config.update({
+            "field_size": self.field_size,
+            "embedding_size": self.embedding_size,
+            "ltl_hidden_size": self.ltl_hidden_size,
+        })
+
         return config
